@@ -30,22 +30,26 @@
 #define PC_SENSE_GPIO  14   // Пин отслеживания PLED+ с колодки JFP1 (1 = ПК включен)
 
 #define POWER_PRESS_MS 300
+#define PC_CHECK_INTERVAL_MS 1000 // Проверка статуса ПК каждую секунду
 
 static btstack_timer_source_t btn_off_timer;
+static btstack_timer_source_t pc_status_timer;
 static bool btn_timer_active = false;
+static bool last_pc_state = false; // Храним последнее известное состояние ПК
 
 // Инициализация пинов для управления ПК
 static void pc_power_control_init(void) {
-    // 1. Инициализация пина кнопки (Управление транзистором C1815)
     gpio_init(POWER_BTN_GPIO);
     gpio_set_dir(POWER_BTN_GPIO, GPIO_OUT);
-    gpio_pull_down(POWER_BTN_GPIO); // Защита от наводок при загрузке
-    gpio_put(POWER_BTN_GPIO, 0);     // 0 = транзистор закрыт, кнопка отпущена
+    gpio_pull_down(POWER_BTN_GPIO);
+    gpio_put(POWER_BTN_GPIO, 0);
 
-    // 2. Инициализация пина-детектора статуса ПК
     gpio_init(PC_SENSE_GPIO);
     gpio_set_dir(PC_SENSE_GPIO, GPIO_IN);
-    gpio_pull_down(PC_SENSE_GPIO);   // Если PLED обесточен -> честный 0
+    gpio_pull_down(PC_SENSE_GPIO);
+
+    // Начальное считывание состояния ПК
+    last_pc_state = (gpio_get(PC_SENSE_GPIO) == 1);
 }
 
 // Колбэк таймера: отжимаем кнопку питания через 300 мс
@@ -56,28 +60,38 @@ static void btn_off_timer_timeout(btstack_timer_source_t *timer) {
     logi("my_platform: Power button RELEASED\n");
 }
 
+// Проверяет, действительно ли ПК полностью включен, или PLED мигает в режиме сна
+static bool is_pc_fully_on(void) {
+    int high_count = 0;
+    // Делаем 10 проверок за 500 мс (интервал 50 мс)
+    for (int i = 0; i < 10; i++) {
+        if (gpio_get(PC_SENSE_GPIO) == 1) {
+            high_count++;
+        }
+        sleep_ms(50);
+    }
+    // Если PLED горел непрерывно ВСЕ 10 проверок — ПК действительно работает на 100%.
+    // Если PLED мигал (count от 1 до 9) или не горел (0) — ПК в режиме сна или выключен!
+    return (high_count == 10);
+}
+
 // Функция безопасного импульса нажатия кнопки
-static bool press_power_button_safe(void) {
-    // 1. Не нажимаем, если импульс уже подается прямо сейчас
-    if (btn_timer_active) {
+static bool press_power_button_safe(bool force) {
+    if (btn_timer_active && !force) {
         logi("my_platform: Button press already in progress...\n");
         return false;
     }
 
-    // 2. Проверяем статус PLED (PC_SENSE_GPIO) с фильтрацией шумов
-    int sense_1 = gpio_get(PC_SENSE_GPIO);
-    sleep_us(100);
-    int sense_2 = gpio_get(PC_SENSE_GPIO);
-
-    // Если на PLED+ действительно есть устойчивое напряжение -> ПК включен
-    if (sense_1 == 1 && sense_2 == 1) {
-        logi("my_platform: PC is already ON (PC_SENSE = 1), skipping press\n");
-        return false;
+    // Если не просили принудительно — проверяем, не включен ли ПК
+    if (!force) {
+        if (is_pc_fully_on()) {
+            logi("my_platform: PC is FULLY ON (solid PLED), skipping press\n");
+            return false;
+        }
     }
 
-    // 3. ПК выключен -> подаем импульс на базу C1815 через таймер
-    logi("my_platform: PC is OFF, PRESSING power button...\n");
-    gpio_put(POWER_BTN_GPIO, 1); // Открываем транзистор
+    logi("my_platform: PC is OFF or SLEEPING -> PRESSING power button!\n");
+    gpio_put(POWER_BTN_GPIO, 1);
 
     btstack_run_loop_set_timer_handler(&btn_off_timer, btn_off_timer_timeout);
     btstack_run_loop_set_timer(&btn_off_timer, POWER_PRESS_MS);
@@ -85,6 +99,38 @@ static bool press_power_button_safe(void) {
     btstack_run_loop_add_timer(&btn_off_timer);
 
     return true;
+}
+
+// Функция отключения всех подключенных геймпадов
+static void disconnect_all_controllers(void) {
+    logi("my_platform: PC turned OFF/SLEEP! Disconnecting gamepad(s)...\n");
+    for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
+        uni_hid_device_t* d = uni_hid_device_get_instance_for_idx(i);
+        if (d && uni_hid_device_is_gamepad(d)) {
+            uni_hid_device_disconnect(d);
+        }
+    }
+}
+
+// Периодический мониторинг состояния ПК
+static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
+    int sense_1 = gpio_get(PC_SENSE_GPIO);
+    sleep_us(100);
+    int sense_2 = gpio_get(PC_SENSE_GPIO);
+    
+    bool current_pc_state = (sense_1 == 1 && sense_2 == 1);
+
+    // Детектируем момент ВЫКЛЮЧЕНИЯ ПК (был 1, стал 0)
+    if (last_pc_state && !current_pc_state) {
+        logi("my_platform: Detected PC Shutdown/Sleep event!\n");
+        disconnect_all_controllers();
+    }
+
+    last_pc_state = current_pc_state;
+
+    // Перезапускаем таймер проверки
+    btstack_run_loop_set_timer(timer, PC_CHECK_INTERVAL_MS);
+    btstack_run_loop_add_timer(timer);
 }
 
 // Declarations
@@ -104,11 +150,8 @@ static void empty_gamepad_report(SwitchOutReport *gamepad) {
 }
 
 uint8_t convert_to_switch_axis(int32_t bluepadAxis) {
-    // bluepad32 reports from -512 to 511 as int32_t
-    // switch reports from 0 to 255 as uint8_t
-
-    bluepadAxis += 513;  // now max possible is 1024
-    bluepadAxis /= 4;    // now max possible is 255
+    bluepadAxis += 513;
+    bluepadAxis /= 4;
 
     if (bluepadAxis < SWITCH_JOYSTICK_MIN)
         bluepadAxis = 0;
@@ -124,7 +167,6 @@ uint8_t convert_to_switch_axis(int32_t bluepadAxis) {
 static void fill_gamepad_report(int idx, uni_gamepad_t *gp) {
     empty_gamepad_report(&report[idx]);
 
-    // face buttons
     if ((gp->buttons & BUTTON_A)) {
         report[idx].buttons |= SWITCH_MASK_A;
     }
@@ -138,7 +180,6 @@ static void fill_gamepad_report(int idx, uni_gamepad_t *gp) {
         report[idx].buttons |= SWITCH_MASK_Y;
     }
 
-    // shoulder buttons
     if ((gp->buttons & BUTTON_SHOULDER_L)) {
         report[idx].buttons |= SWITCH_MASK_L;
     }
@@ -146,7 +187,6 @@ static void fill_gamepad_report(int idx, uni_gamepad_t *gp) {
         report[idx].buttons |= SWITCH_MASK_R;
     }
 
-    // dpad
     switch (gp->dpad) {
     case DPAD_UP:
         report[idx].hat = SWITCH_HAT_UP;
@@ -177,7 +217,6 @@ static void fill_gamepad_report(int idx, uni_gamepad_t *gp) {
         break;
     }
 
-    // sticks
     report[idx].lx = convert_to_switch_axis(gp->axis_x);
     report[idx].ly = convert_to_switch_axis(gp->axis_y);
     report[idx].rx = convert_to_switch_axis(gp->axis_rx);
@@ -187,13 +226,11 @@ static void fill_gamepad_report(int idx, uni_gamepad_t *gp) {
     if ((gp->buttons & BUTTON_THUMB_R))
         report[idx].buttons |= SWITCH_MASK_R3;
 
-    // triggers
     if (gp->brake)
         report[idx].buttons |= SWITCH_MASK_ZL;
     if (gp->throttle)
         report[idx].buttons |= SWITCH_MASK_ZR;
 
-    // misc buttons
     if (gp->misc_buttons & MISC_BUTTON_SYSTEM)
         report[idx].buttons |= SWITCH_MASK_HOME;
     if (gp->misc_buttons & MISC_BUTTON_CAPTURE)
@@ -220,7 +257,6 @@ static void pico_switch_platform_init(int argc, const char** argv) {
 
     logi("my_platform: init()\n");
 
-    // Инициализируем пины кнопки и детектора статуса ПК
     pc_power_control_init();
 
     btn_timer_active = false;
@@ -228,7 +264,6 @@ static void pico_switch_platform_init(int argc, const char** argv) {
 
     uni_gamepad_mappings_t mappings = GAMEPAD_DEFAULT_MAPPINGS;
 
-    // remaps
     mappings.button_b = UNI_GAMEPAD_MAPPINGS_BUTTON_A;
     mappings.button_a = UNI_GAMEPAD_MAPPINGS_BUTTON_B;
     mappings.button_y = UNI_GAMEPAD_MAPPINGS_BUTTON_X;
@@ -249,20 +284,22 @@ static void pico_switch_platform_init(int argc, const char** argv) {
 static void pico_switch_platform_on_init_complete(void) {
     logi("my_platform: on_init_complete()\n");
 
-    // Start scanning
     uni_bt_enable_new_connections_unsafe(true);
 
-    // НЕ удаляем ключи при каждом старте! (ставим 0)
     if (0)
         uni_bt_del_keys_unsafe();
     else
         uni_bt_list_keys_unsafe();
 
-    // Turn off LED once init is done.
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
 
+    // Запускаем фоновый мониторинг состояния ПК (каждую секунду)
+    btstack_run_loop_set_timer_handler(&pc_status_timer, pc_status_timer_timeout);
+    btstack_run_loop_set_timer(&pc_status_timer, PC_CHECK_INTERVAL_MS);
+    btstack_run_loop_add_timer(&pc_status_timer);
+
     logi("BLUEPAD: ready to fill reports\n");
-    multicore_fifo_push_blocking(0); // signal other core to start reading
+    multicore_fifo_push_blocking(0);
 }
 
 static void pico_switch_platform_on_device_connected(uni_hid_device_t* d) {
@@ -271,6 +308,10 @@ static void pico_switch_platform_on_device_connected(uni_hid_device_t* d) {
 
 static void pico_switch_platform_on_device_disconnected(uni_hid_device_t* d) {
     logi("my_platform: device disconnected: %p\n", d);
+    
+    btn_timer_active = false;
+    gpio_put(POWER_BTN_GPIO, 0); // Безопасное отключение транзистора
+
     for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
         empty_gamepad_report(&report[i]);
         idx_r.idx = i;
@@ -286,8 +327,11 @@ static void pico_switch_platform_on_device_disconnected(uni_hid_device_t* d) {
 static uni_error_t pico_switch_platform_on_device_ready(uni_hid_device_t* d) {
     logi("my_platform: device ready: %p\n", d);
 
-    // Безопасно включаем ПК при готовности геймпада
-    press_power_button_safe();
+    // Безопасно включаем/разбуживаем ПК при готовности геймпада (false = не принудительно)
+    press_power_button_safe(false);
+
+    // Обновляем текущее состояние ПК
+    last_pc_state = (gpio_get(PC_SENSE_GPIO) == 1);
 
     connected_controllers++;
     set_led_status();
@@ -299,10 +343,17 @@ static void pico_switch_platform_on_controller_data(uni_hid_device_t* d, uni_con
         return;
     }
 
-    uni_gamepad_t *gp;
-    uint8_t idx = uni_hid_device_get_idx_for_instance(d);
+    uni_gamepad_t *gp = &ctl->gamepad;
 
-    gp = &ctl->gamepad;
+    // Ручная комбинация принудительного старта: L1 + R1 + Home (System)
+    if ((gp->buttons & BUTTON_SHOULDER_L) && 
+        (gp->buttons & BUTTON_SHOULDER_R) && 
+        (gp->misc_buttons & MISC_BUTTON_SYSTEM)) {
+        logi("my_platform: Force power press combo activated!\n");
+        press_power_button_safe(true); // true = принудительно, независимо от PLED
+    }
+
+    uint8_t idx = uni_hid_device_get_idx_for_instance(d);
     fill_gamepad_report(idx, gp);
     idx_r.idx = idx;
     idx_r.report = report[idx];
@@ -318,29 +369,6 @@ static void pico_switch_platform_on_oob_event(uni_platform_oob_event_t event, vo
     ARG_UNUSED(event);
     ARG_UNUSED(data);
     return;
-}
-
-//
-// Helpers - UNUSED
-//
-static void trigger_event_on_gamepad(uni_hid_device_t* d) {
-    if (d->report_parser.set_player_leds != NULL) {
-        static uint8_t led = 0;
-        led += 1;
-        led &= 0xf;
-        d->report_parser.set_player_leds(d, led);
-    }
-
-    if (d->report_parser.set_lightbar_color != NULL) {
-        static uint8_t red = 0x10;
-        static uint8_t green = 0x20;
-        static uint8_t blue = 0x40;
-
-        red += 0x10;
-        green -= 0x20;
-        blue += 0x40;
-        d->report_parser.set_lightbar_color(d, red, green, blue);
-    }
 }
 
 //
