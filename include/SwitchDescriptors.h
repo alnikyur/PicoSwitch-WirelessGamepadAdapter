@@ -68,8 +68,8 @@ typedef struct {
 } SwitchIdxOutReport;
 
 static const uint8_t switch_string_language[] = {0x09, 0x04};
-static const uint8_t switch_string_manufacturer[] = "518";
-static const uint8_t switch_string_product[] = "PICOSWITCH CONTROLLER";
+static const uint8_t switch_string_manufacturer[] = "";
+static const uint8_t switch_string_product[] = "PICO-DIY";
 static const uint8_t switch_string_version[] = "1.0";
 
 static const uint8_t *switch_string_descriptors[] =

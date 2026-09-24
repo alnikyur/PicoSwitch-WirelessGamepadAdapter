@@ -264,8 +264,8 @@ static void pico_switch_platform_init(int argc, const char** argv) {
 
     uni_gamepad_mappings_t mappings = GAMEPAD_DEFAULT_MAPPINGS;
 
-    mappings.button_b = UNI_GAMEPAD_MAPPINGS_BUTTON_A;
-    mappings.button_a = UNI_GAMEPAD_MAPPINGS_BUTTON_B;
+    mappings.button_a = UNI_GAMEPAD_MAPPINGS_BUTTON_A;
+    mappings.button_b = UNI_GAMEPAD_MAPPINGS_BUTTON_B;
     mappings.button_y = UNI_GAMEPAD_MAPPINGS_BUTTON_X;
     mappings.button_x = UNI_GAMEPAD_MAPPINGS_BUTTON_Y;
 
