@@ -32,8 +32,10 @@
 
 static btstack_timer_source_t btn_off_timer;
 static btstack_timer_source_t pc_status_timer;
+static btstack_timer_source_t deferred_disconnect_timer;
 static bool btn_timer_active = false;
 static bool last_pc_state = false; // Храним последнее известное состояние ПК
+static bool pc_state_initialized = false; // false, пока не сделано первое измерение
 
 // Инициализация пинов для управления ПК
 static void pc_power_control_init(void) {
@@ -48,6 +50,7 @@ static void pc_power_control_init(void) {
 
     // Начальное считывание состояния ПК
     last_pc_state = (gpio_get(PC_SENSE_GPIO) == 1);
+    pc_state_initialized = true;
 }
 
 // Колбэк таймера: отжимаем кнопку питания через 300 мс
@@ -100,6 +103,13 @@ static bool press_power_button_safe(bool force) {
 }
 
 // Функция отключения всех подключенных геймпадов
+//
+// ВАЖНО: эту функцию нельзя вызывать напрямую из btstack-таймера.
+// uni_hid_device_disconnect() синхронно вызывает
+// pico_switch_platform_on_device_disconnected(), а тот берёт лок
+// cyw43 async context. Мы уже находимся внутри этого же run loop, поэтому
+// повторный захват лока приводит к самоблокировке — геймпад не отключается.
+// Поэтому отключение всегда откладывается на отдельный таймер (см. ниже).
 static void disconnect_all_controllers(void) {
     logi("my_platform: PC turned OFF/SLEEP! Disconnecting gamepad(s)...\n");
     for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
@@ -110,6 +120,21 @@ static void disconnect_all_controllers(void) {
     }
 }
 
+// Отложенный вызов disconnect_all_controllers().
+// Запускается из pc_status_timer_timeout(), но выполняется уже ПОСЛЕ
+// возврата из колбэка таймера, когда лок cyw43 async context не удерживается.
+static void deferred_disconnect_timer_timeout(btstack_timer_source_t *timer) {
+    (void)timer;
+    disconnect_all_controllers();
+}
+
+static void schedule_disconnect_all_controllers(void) {
+    btstack_run_loop_set_timer_handler(&deferred_disconnect_timer,
+                                       deferred_disconnect_timer_timeout);
+    btstack_run_loop_set_timer(&deferred_disconnect_timer, 0);
+    btstack_run_loop_add_timer(&deferred_disconnect_timer);
+}
+
 // Периодический мониторинг состояния ПК
 static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
     int sense_1 = gpio_get(PC_SENSE_GPIO);
@@ -118,13 +143,16 @@ static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
     
     bool current_pc_state = (sense_1 == 1 && sense_2 == 1);
 
-    // Детектируем момент ВЫКЛЮЧЕНИЯ ПК (был 1, стал 0)
-    if (last_pc_state && !current_pc_state) {
+    // Детектируем момент ВЫКЛЮЧЕНИЯ ПК (был 1, стал 0).
+    // Только при первом измерении НЕ сравниваем: иначе выключенный на момент
+    // старта ПК сразу даст ложное событие.
+    if (pc_state_initialized && last_pc_state && !current_pc_state) {
         logi("my_platform: Detected PC Shutdown/Sleep event!\n");
-        disconnect_all_controllers();
+        schedule_disconnect_all_controllers();
     }
 
     last_pc_state = current_pc_state;
+    pc_state_initialized = true;
 
     // Перезапускаем таймер проверки
     btstack_run_loop_set_timer(timer, PC_CHECK_INTERVAL_MS);
@@ -293,6 +321,7 @@ static void pico_switch_platform_init(int argc, const char** argv) {
 
     btn_timer_active = false;
     connected_controllers = 0;
+    pc_state_initialized = false;
 
     uni_gamepad_mappings_t mappings = GAMEPAD_DEFAULT_MAPPINGS;
 
@@ -362,8 +391,16 @@ static uni_error_t pico_switch_platform_on_device_ready(uni_hid_device_t* d) {
     // Безопасно включаем/разбуживаем ПК при готовности геймпада (false = не принудительно)
     press_power_button_safe(false);
 
-    // Обновляем текущее состояние ПК
-    last_pc_state = (gpio_get(PC_SENSE_GPIO) == 1);
+    // НЕ перезаписываем last_pc_state здесь безусловно.
+    // Если записать состояние, пока ПК ещё грузится (PLED = 0), мы потеряем
+    // фронт 1->0 при последующем выключении и геймпад не отключится.
+    // Состоянием управляет только pc_status_timer_timeout().
+    // Единственное, что делаем: если состояние ещё ни разу не измерялось —
+    // фиксируем текущее как начальное.
+    if (!pc_state_initialized) {
+        last_pc_state = (gpio_get(PC_SENSE_GPIO) == 1);
+        pc_state_initialized = true;
+    }
 
     connected_controllers++;
     set_led_status();
