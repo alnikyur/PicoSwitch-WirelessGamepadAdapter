@@ -99,14 +99,14 @@ extern "C"
 #endif
 
 //------------- CLASS -------------//
-#define CFG_TUD_HID 4
+// The Xbox 360 emulation is a *custom* class driver installed through
+// usbd_app_driver_get_cb(), so no built-in TinyUSB class is enabled here.
+// HID (the old Switch Pro emulation) is disabled.
+#define CFG_TUD_HID 0
 #define CFG_TUD_CDC 0
 #define CFG_TUD_MSC 0
 #define CFG_TUD_MIDI 0
 #define CFG_TUD_VENDOR 0
-
-// HID buffer size Should be sufficient to hold ID (if any) + Data
-#define CFG_TUD_HID_EP_BUFSIZE 16
 
 #ifdef __cplusplus
 }

@@ -14,14 +14,12 @@
 #include "uni_log.h"
 #include "usb.h"
 #include "report.h"
-#include "SwitchDescriptors.h"
+#include "xinput_device.h"
 
 // Sanity check
 #ifndef CONFIG_BLUEPAD32_PLATFORM_CUSTOM
 #error "Pico W must use BLUEPAD32_PLATFORM_CUSTOM"
 #endif
-
-#define AXIS_DEADZONE 0xa
 
 // --------------------------------------------------------------------------
 // Конфигурация пинов управления ПК
@@ -135,110 +133,144 @@ static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
 
 // Declarations
 static void trigger_event_on_gamepad(uni_hid_device_t *d);
-SwitchOutReport report[CONFIG_BLUEPAD32_MAX_DEVICES];
-SwitchIdxOutReport idx_r;
+XInputReport report[CONFIG_BLUEPAD32_MAX_DEVICES];
+XInputIdxReport idx_r;
 uint8_t connected_controllers;
 
-// Helper functions
-static void empty_gamepad_report(SwitchOutReport *gamepad) {
-    gamepad->buttons = 0;
-    gamepad->hat = SWITCH_HAT_NOTHING;
-    gamepad->lx = SWITCH_JOYSTICK_MID;
-    gamepad->ly = SWITCH_JOYSTICK_MID;
-    gamepad->rx = SWITCH_JOYSTICK_MID;
-    gamepad->ry = SWITCH_JOYSTICK_MID;
+// --------------------------------------------------------------------------
+// Маппинг Bluepad32 -> XInput
+// --------------------------------------------------------------------------
+//
+// Соответствие кнопок (для проверки):
+//
+//  Bluepad32                      XInput byte2/byte3
+//  -----------------------------  -------------------------------------
+//  DPAD_UP                        byte2 0x01  (D-pad Up)
+//  DPAD_DOWN                      byte2 0x02  (D-pad Down)
+//  DPAD_LEFT                      byte2 0x04  (D-pad Left)
+//  DPAD_RIGHT                     byte2 0x08  (D-pad Right)
+//  MISC_BUTTON_START  (+)         byte2 0x10  (Start / Menu)
+//  MISC_BUTTON_SELECT (-)         byte2 0x20  (Back / View)
+//  BUTTON_THUMB_L                 byte2 0x40  (L3)
+//  BUTTON_THUMB_R                 byte2 0x80  (R3)
+//  BUTTON_SHOULDER_L              byte3 0x01  (LB)
+//  BUTTON_SHOULDER_R              byte3 0x02  (RB)
+//  MISC_BUTTON_SYSTEM (Home/PS)   byte3 0x04  (Guide / Xbox)
+//  BUTTON_A                       byte3 0x10  (A)
+//  BUTTON_B                       byte3 0x20  (B)
+//  BUTTON_X                       byte3 0x40  (X)
+//  BUTTON_Y                       byte3 0x80  (Y)
+//
+//  brake    (0..1023)             byte4     (left trigger, 0..255)
+//  throttle (0..1023)             byte5     (right trigger, 0..255)
+//  axis_x   (-512..511)           bytes 6-7 (LX, int16 LE)
+//  axis_y   (-512..511)           bytes 8-9 (LY, int16 LE, inverted)
+//  axis_rx  (-512..511)           bytes 10-11 (RX, int16 LE)
+//  axis_ry  (-512..511)           bytes 12-13 (RY, int16 LE, inverted)
+//
+// Примечания:
+//  * BUTTON_TRIGGER_L / BUTTON_TRIGGER_R (цифровые "нажатия" триггеров)
+//    отдельно не обрабатываются: триггеры передаются как аналоговые
+//    значения из brake/throttle. Если у геймпада нет аналоговых триггеров,
+//    стоить добавить их как LB/RB.
+//  * MISC_BUTTON_CAPTURE не имеет прямого аналога на Xbox 360, поэтому
+//    игнорируется.
+//  * bytes 14-19 остаются нулями (зарезервированы).
+
+#define XINPUT_TRIGGER_MAX 1023
+
+// 0..1023 -> 0..255
+static uint8_t trigger_to_xinput(int32_t value) {
+    if (value <= 0)
+        return 0;
+    if (value > XINPUT_TRIGGER_MAX)
+        value = XINPUT_TRIGGER_MAX;
+    return (uint8_t) (value * 255 / XINPUT_TRIGGER_MAX);
 }
 
-uint8_t convert_to_switch_axis(int32_t bluepadAxis) {
-    bluepadAxis += 513;
-    bluepadAxis /= 4;
+// -512..511 -> -32768..32767, с инверсией (для Y-осей) и ограничением диапазона.
+//
+// ВАЖНО: все вычисления и инверсия делаются в int32, а в int16 значение
+// приводится только после ограничения. Раньше значение 512 * 64 = 32768 и
+// инверсия -(-32768) = 32768 переполняли int16 и меняли знак на краю хода
+// стика (стик "перескакивал" на противоположную сторону).
+static int16_t axis_to_xinput(int32_t value, bool invert) {
+    if (value > 511)
+        value = 511;
+    if (value < -512)
+        value = -512;
 
-    if (bluepadAxis < SWITCH_JOYSTICK_MIN)
-        bluepadAxis = 0;
-    else if ((bluepadAxis > (SWITCH_JOYSTICK_MID - AXIS_DEADZONE)) &&
-             (bluepadAxis < (SWITCH_JOYSTICK_MID + AXIS_DEADZONE))) {
-        bluepadAxis = SWITCH_JOYSTICK_MID;
-    } else if (bluepadAxis > SWITCH_JOYSTICK_MAX)
-        bluepadAxis = SWITCH_JOYSTICK_MAX;
+    // -512 -> -32768, 0 -> 0, 511 -> 32767
+    int32_t out = (value >= 0) ? (value * 32767) / 511 : value * 64;
 
-    return (uint8_t) bluepadAxis;
+    if (invert)
+        out = -out;
+
+    if (out > 32767)
+        out = 32767;
+    if (out < -32768)
+        out = -32768;
+
+    return (int16_t) out;
+}
+
+static void empty_gamepad_report(XInputReport *gamepad) {
+    memset(gamepad, 0, sizeof(*gamepad));
+    gamepad->header0 = XINPUT_REPORT_HEADER_0;
+    gamepad->header1 = XINPUT_REPORT_HEADER_1;
 }
 
 static void fill_gamepad_report(int idx, uni_gamepad_t *gp) {
-    empty_gamepad_report(&report[idx]);
+    XInputReport *r = &report[idx];
 
-    if ((gp->buttons & BUTTON_A)) {
-        report[idx].buttons |= SWITCH_MASK_A;
-    }
-    if ((gp->buttons & BUTTON_B)) {
-        report[idx].buttons |= SWITCH_MASK_B;
-    }
-    if ((gp->buttons & BUTTON_X)) {
-        report[idx].buttons |= SWITCH_MASK_X;
-    }
-    if ((gp->buttons & BUTTON_Y)) {
-        report[idx].buttons |= SWITCH_MASK_Y;
-    }
+    empty_gamepad_report(r);
 
-    if ((gp->buttons & BUTTON_SHOULDER_L)) {
-        report[idx].buttons |= SWITCH_MASK_L;
-    }
-    if ((gp->buttons & BUTTON_SHOULDER_R)) {
-        report[idx].buttons |= SWITCH_MASK_R;
-    }
+    // D-pad
+    if (gp->dpad & DPAD_UP)
+        r->buttons2 |= XINPUT_DPAD_UP;
+    if (gp->dpad & DPAD_DOWN)
+        r->buttons2 |= XINPUT_DPAD_DOWN;
+    if (gp->dpad & DPAD_LEFT)
+        r->buttons2 |= XINPUT_DPAD_LEFT;
+    if (gp->dpad & DPAD_RIGHT)
+        r->buttons2 |= XINPUT_DPAD_RIGHT;
 
-    switch (gp->dpad) {
-    case DPAD_UP:
-        report[idx].hat = SWITCH_HAT_UP;
-        break;
-    case DPAD_DOWN:
-        report[idx].hat = SWITCH_HAT_DOWN;
-        break;
-    case DPAD_LEFT:
-        report[idx].hat = SWITCH_HAT_LEFT;
-        break;
-    case DPAD_RIGHT:
-        report[idx].hat = SWITCH_HAT_RIGHT;
-        break;
-    case DPAD_UP | DPAD_RIGHT:
-        report[idx].hat = SWITCH_HAT_UPRIGHT;
-        break;
-    case DPAD_DOWN | DPAD_RIGHT:
-        report[idx].hat = SWITCH_HAT_DOWNRIGHT;
-        break;
-    case DPAD_DOWN | DPAD_LEFT:
-        report[idx].hat = SWITCH_HAT_DOWNLEFT;
-        break;
-    case DPAD_UP | DPAD_LEFT:
-        report[idx].hat = SWITCH_HAT_UPLEFT;
-        break;
-    default:
-        report[idx].hat = SWITCH_HAT_NOTHING;
-        break;
-    }
+    // Start / Back / thumb clicks
+    if (gp->misc_buttons & MISC_BUTTON_START)
+        r->buttons2 |= XINPUT_BUTTON_START;
+    if (gp->misc_buttons & MISC_BUTTON_SELECT)
+        r->buttons2 |= XINPUT_BUTTON_BACK;
+    if (gp->buttons & BUTTON_THUMB_L)
+        r->buttons2 |= XINPUT_BUTTON_L3;
+    if (gp->buttons & BUTTON_THUMB_R)
+        r->buttons2 |= XINPUT_BUTTON_R3;
 
-    report[idx].lx = convert_to_switch_axis(gp->axis_x);
-    report[idx].ly = convert_to_switch_axis(gp->axis_y);
-    report[idx].rx = convert_to_switch_axis(gp->axis_rx);
-    report[idx].ry = convert_to_switch_axis(gp->axis_ry);
-    if ((gp->buttons & BUTTON_THUMB_L))
-        report[idx].buttons |= SWITCH_MASK_L3;
-    if ((gp->buttons & BUTTON_THUMB_R))
-        report[idx].buttons |= SWITCH_MASK_R3;
-
-    if (gp->brake)
-        report[idx].buttons |= SWITCH_MASK_ZL;
-    if (gp->throttle)
-        report[idx].buttons |= SWITCH_MASK_ZR;
-
+    // Shoulders / guide / face buttons
+    if (gp->buttons & BUTTON_SHOULDER_L)
+        r->buttons3 |= XINPUT_BUTTON_LB;
+    if (gp->buttons & BUTTON_SHOULDER_R)
+        r->buttons3 |= XINPUT_BUTTON_RB;
     if (gp->misc_buttons & MISC_BUTTON_SYSTEM)
-        report[idx].buttons |= SWITCH_MASK_HOME;
-    if (gp->misc_buttons & MISC_BUTTON_CAPTURE)
-        report[idx].buttons |= SWITCH_MASK_CAPTURE;
-    if (gp->misc_buttons & MISC_BUTTON_BACK)
-        report[idx].buttons |= SWITCH_MASK_MINUS;
-    if (gp->misc_buttons & MISC_BUTTON_HOME)
-        report[idx].buttons |= SWITCH_MASK_PLUS;
+        r->buttons3 |= XINPUT_BUTTON_GUIDE;
+    if (gp->buttons & BUTTON_A)
+        r->buttons3 |= XINPUT_BUTTON_A;
+    if (gp->buttons & BUTTON_B)
+        r->buttons3 |= XINPUT_BUTTON_B;
+    if (gp->buttons & BUTTON_X)
+        r->buttons3 |= XINPUT_BUTTON_X;
+    if (gp->buttons & BUTTON_Y)
+        r->buttons3 |= XINPUT_BUTTON_Y;
+
+    // Analog triggers
+    r->trigger_l = trigger_to_xinput(gp->brake);
+    r->trigger_r = trigger_to_xinput(gp->throttle);
+
+    // Analog sticks. Y axes are inverted: Bluepad32 reports "up" as negative,
+    // XInput reports "up" as positive.
+    r->axis_lx = axis_to_xinput(gp->axis_x, false);
+    r->axis_ly = axis_to_xinput(gp->axis_y, true);
+    r->axis_rx = axis_to_xinput(gp->axis_rx, false);
+    r->axis_ry = axis_to_xinput(gp->axis_ry, true);
 }
 
 static void set_led_status(void) {
@@ -266,18 +298,17 @@ static void pico_switch_platform_init(int argc, const char** argv) {
 
     mappings.button_a = UNI_GAMEPAD_MAPPINGS_BUTTON_A;
     mappings.button_b = UNI_GAMEPAD_MAPPINGS_BUTTON_B;
-    mappings.button_y = UNI_GAMEPAD_MAPPINGS_BUTTON_X;
-    mappings.button_x = UNI_GAMEPAD_MAPPINGS_BUTTON_Y;
+    mappings.button_y = UNI_GAMEPAD_MAPPINGS_BUTTON_Y;
+    mappings.button_x = UNI_GAMEPAD_MAPPINGS_BUTTON_X;
 
     uni_gamepad_set_mappings(&mappings);
 
+    for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
+        empty_gamepad_report(&report[i]);
+    }
+
     idx_r.idx = 0;
-    idx_r.report.buttons = 0;
-    idx_r.report.hat = SWITCH_HAT_NOTHING;
-    idx_r.report.lx = 0;
-    idx_r.report.ly = 0;
-    idx_r.report.rx = 0;
-    idx_r.report.ry = 0;
+    empty_xinput_report(&idx_r);
     set_global_gamepad_report(&idx_r);
 }
 
@@ -318,6 +349,7 @@ static void pico_switch_platform_on_device_disconnected(uni_hid_device_t* d) {
         idx_r.report = report[i];
         set_global_gamepad_report(&idx_r);
     }
+
     if (connected_controllers > 0) {
         connected_controllers--;
     }

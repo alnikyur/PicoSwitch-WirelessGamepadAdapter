@@ -28,6 +28,7 @@ add_executable(PicoSwitchWGA ${SOURCES})
 
 target_include_directories(PicoSwitchWGA PRIVATE
     src
+    include
     bluepad32/src/components/bluepad32/include)
 include_directories(include)
 
@@ -48,6 +49,9 @@ target_link_libraries(PicoSwitchWGA
 
 add_subdirectory(bluepad32/src/components/bluepad32 libbluepad32)
 
+# USB stdio must stay OFF. If it were enabled, the SDK would pull in a CDC
+# class driver in addition to our custom Xbox 360 driver, which is not part of
+# the Xbox 360 descriptors and would break the single-interface device.
 pico_enable_stdio_usb(PicoSwitchWGA 0)
 pico_enable_stdio_uart(PicoSwitchWGA 0)
 
