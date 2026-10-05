@@ -33,9 +33,15 @@
 static btstack_timer_source_t btn_off_timer;
 static btstack_timer_source_t pc_status_timer;
 static btstack_timer_source_t deferred_disconnect_timer;
+static bool deferred_disconnect_timer_active = false;
 static bool btn_timer_active = false;
 static bool last_pc_state = false; // Храним последнее известное состояние ПК
 static bool pc_state_initialized = false; // false, пока не сделано первое измерение
+
+// true, когда ПК выключен/спит и геймпады отключены.
+// Пока этот флаг установлен, USB-устройство отсоединено от хоста,
+// поэтому ПК реально «теряет» геймпад, а не продолжает слать репорты.
+static bool pc_off = false;
 
 // Инициализация пинов для управления ПК
 static void pc_power_control_init(void) {
@@ -61,19 +67,25 @@ static void btn_off_timer_timeout(btstack_timer_source_t *timer) {
     logi("my_platform: Power button RELEASED\n");
 }
 
-// Проверяет, действительно ли ПК полностью включен, или PLED мигает в режиме сна
+// Неблокирующая проверка «ПК действительно включён».
+//
+// Раньше здесь было 10 замеров с sleep_ms(50) прямо на потоке run loop
+// (500 мс). Это блокировало обработку BTstack/cyw43, из-за чего отложенный
+// таймер отключения успевал зарегистрироваться повторно (btstack_assert),
+// и прошивка переставала реагировать на выключение ПК.
+//
+// Теперь мы просто снимаем несколько быстрых отсчётов подряд (микросекунды),
+// а длинное усреднение делает периодический таймер pc_status_timer.
 static bool is_pc_fully_on(void) {
-    int high_count = 0;
-    // Делаем 10 проверок за 500 мс (интервал 50 мс)
-    for (int i = 0; i < 10; i++) {
-        if (gpio_get(PC_SENSE_GPIO) == 1) {
-            high_count++;
+    // 8 быстрых отсчётов подряд: у включённого ПК PLED горит непрерывно,
+    // у спящего — мигает, поэтому любой ноль означает «не включён».
+    for (int i = 0; i < 8; i++) {
+        if (gpio_get(PC_SENSE_GPIO) != 1) {
+            return false;
         }
-        sleep_ms(50);
+        sleep_us(50);
     }
-    // Если PLED горел непрерывно ВСЕ 10 проверок — ПК действительно работает на 100%.
-    // Если PLED мигал (count от 1 до 9) или не горел (0) — ПК в режиме сна или выключен!
-    return (high_count == 10);
+    return true;
 }
 
 // Функция безопасного импульса нажатия кнопки
@@ -83,9 +95,11 @@ static bool press_power_button_safe(bool force) {
         return false;
     }
 
-    // Если не просили принудительно — проверяем, не включен ли ПК
+    // Если не просили принудительно — проверяем, не включен ли ПК.
+    // Если ПК уже помечен как выключенный (pc_off), не трогаем кнопку:
+    // включение выполняется только по явному событию готовности геймпада.
     if (!force) {
-        if (is_pc_fully_on()) {
+        if (!pc_off && is_pc_fully_on()) {
             logi("my_platform: PC is FULLY ON (solid PLED), skipping press\n");
             return false;
         }
@@ -102,14 +116,11 @@ static bool press_power_button_safe(bool force) {
     return true;
 }
 
-// Функция отключения всех подключенных геймпадов
+// Функция отключения всех подключенных геймпадов.
 //
-// ВАЖНО: эту функцию нельзя вызывать напрямую из btstack-таймера.
-// uni_hid_device_disconnect() синхронно вызывает
-// pico_switch_platform_on_device_disconnected(), а тот берёт лок
-// cyw43 async context. Мы уже находимся внутри этого же run loop, поэтому
-// повторный захват лока приводит к самоблокировке — геймпад не отключается.
-// Поэтому отключение всегда откладывается на отдельный таймер (см. ниже).
+// Вызывается из btstack-таймера. Лок cyw43 async context — рекурсивный
+// (pico_cyw43_arch_none использует async_context_threadsafe_background),
+// поэтому повторный захват внутри set_global_gamepad_report() безопасен.
 static void disconnect_all_controllers(void) {
     logi("my_platform: PC turned OFF/SLEEP! Disconnecting gamepad(s)...\n");
     for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
@@ -121,14 +132,27 @@ static void disconnect_all_controllers(void) {
 }
 
 // Отложенный вызов disconnect_all_controllers().
-// Запускается из pc_status_timer_timeout(), но выполняется уже ПОСЛЕ
-// возврата из колбэка таймера, когда лок cyw43 async context не удерживается.
+// Выполняется отдельным таймером ПОСЛЕ возврата из pc_status_timer_timeout(),
+// чтобы не разбирать список устройств прямо во время обработки другого таймера.
 static void deferred_disconnect_timer_timeout(btstack_timer_source_t *timer) {
     (void)timer;
+    deferred_disconnect_timer_active = false;
+
+    // Отсоединяем USB-устройство: так хост (Windows/Linux) реально видит,
+    // что геймпад исчез, а не продолжает получать репорты вечно.
+    usb_request_attach(false);
+
     disconnect_all_controllers();
 }
 
 static void schedule_disconnect_all_controllers(void) {
+    if (deferred_disconnect_timer_active) {
+        // Уже запланировано — повторная регистрация того же timer_source
+        // приводит к btstack_assert(false) и зависанию прошивки.
+        return;
+    }
+
+    deferred_disconnect_timer_active = true;
     btstack_run_loop_set_timer_handler(&deferred_disconnect_timer,
                                        deferred_disconnect_timer_timeout);
     btstack_run_loop_set_timer(&deferred_disconnect_timer, 0);
@@ -140,7 +164,7 @@ static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
     int sense_1 = gpio_get(PC_SENSE_GPIO);
     sleep_us(100);
     int sense_2 = gpio_get(PC_SENSE_GPIO);
-    
+
     bool current_pc_state = (sense_1 == 1 && sense_2 == 1);
 
     // Детектируем момент ВЫКЛЮЧЕНИЯ ПК (был 1, стал 0).
@@ -148,13 +172,25 @@ static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
     // старта ПК сразу даст ложное событие.
     if (pc_state_initialized && last_pc_state && !current_pc_state) {
         logi("my_platform: Detected PC Shutdown/Sleep event!\n");
+        pc_off = true;
         schedule_disconnect_all_controllers();
+    }
+
+    // ПК снова включился: возвращаем USB-устройство на шину, чтобы хост
+    // снова увидел геймпад. Геймпады при этом переподключаются штатно.
+    if (pc_state_initialized && !last_pc_state && current_pc_state) {
+        logi("my_platform: Detected PC Power-ON event!\n");
+        pc_off = false;
+        usb_request_attach(true);
     }
 
     last_pc_state = current_pc_state;
     pc_state_initialized = true;
 
-    // Перезапускаем таймер проверки
+    // Перезапускаем таймер проверки.
+    // remove+add: таймер снимается process_timers() перед вызовом колбэка,
+    // но remove() защищает от случайной повторной регистрации.
+    btstack_run_loop_remove_timer(timer);
     btstack_run_loop_set_timer(timer, PC_CHECK_INTERVAL_MS);
     btstack_run_loop_add_timer(timer);
 }
@@ -322,6 +358,8 @@ static void pico_switch_platform_init(int argc, const char** argv) {
     btn_timer_active = false;
     connected_controllers = 0;
     pc_state_initialized = false;
+    deferred_disconnect_timer_active = false;
+    pc_off = false;
 
     uni_gamepad_mappings_t mappings = GAMEPAD_DEFAULT_MAPPINGS;
 
@@ -388,6 +426,11 @@ static void pico_switch_platform_on_device_disconnected(uni_hid_device_t* d) {
 static uni_error_t pico_switch_platform_on_device_ready(uni_hid_device_t* d) {
     logi("my_platform: device ready: %p\n", d);
 
+    // Геймпад готов: гарантированно возвращаем USB-устройство на шину.
+    // Если ПК был выключен и геймпадом его разбудили/включили, без этого
+    // хост не увидел бы контроллер после пробуждения.
+    usb_request_attach(true);
+
     // Безопасно включаем/разбуживаем ПК при готовности геймпада (false = не принудительно)
     press_power_button_safe(false);
 
@@ -400,6 +443,11 @@ static uni_error_t pico_switch_platform_on_device_ready(uni_hid_device_t* d) {
     if (!pc_state_initialized) {
         last_pc_state = (gpio_get(PC_SENSE_GPIO) == 1);
         pc_state_initialized = true;
+    }
+
+    // Если ПК включён — снимаем флаг «выключен».
+    if (last_pc_state) {
+        pc_off = false;
     }
 
     connected_controllers++;
