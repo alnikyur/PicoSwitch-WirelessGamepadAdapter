@@ -7,6 +7,7 @@
 
 #include "sdkconfig.h"
 #include "usb.h"
+#include "report.h"
 
 // Sanity check
 #ifndef CONFIG_BLUEPAD32_PLATFORM_CUSTOM
@@ -41,6 +42,7 @@ int
 main()
 {
 	stdio_init_all();
+	report_init();
 
 	multicore_launch_core1(bluepad_core_task);
 	usb_core_task();

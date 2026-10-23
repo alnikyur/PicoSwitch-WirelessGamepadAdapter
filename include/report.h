@@ -13,6 +13,8 @@ typedef struct {
 	XInputReport report;
 } XInputIdxReport;
 
+// Call on core0 before launching core1. The lock only covers a report copy.
+void report_init(void);
 void set_global_gamepad_report(XInputIdxReport *rpt);
 void get_global_gamepad_report(XInputIdxReport *rpt);
 

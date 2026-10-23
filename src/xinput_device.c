@@ -176,25 +176,41 @@ static uint16_t xinput_open(uint8_t rhport, tusb_desc_interface_t const *itf_des
 	return consumed;
 }
 
-// Control requests reaching the interface (recipient = interface).
-// Nothing meaningful to implement; acknowledge so the host never stalls.
+// Linux xpad_start_input() requests a 20-byte initialization reply on open
+// and resume: C1/01, wValue=0100, wIndex=0. xpad ignores the payload. Supply
+// a neutral XInput report, with static storage for the asynchronous transfer.
+// TinyUSB routes vendor requests here before dispatching by recipient.
+bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
+                                tusb_control_request_t const *request)
+{
+    static uint8_t reply[XINPUT_REPORT_SIZE] = {
+        XINPUT_REPORT_HEADER_0, XINPUT_REPORT_HEADER_1
+    };
+    if (request->bmRequestType != 0xC1 || request->bRequest != 0x01 ||
+        request->wValue != 0x0100 || request->wIndex != 0 ||
+        request->wLength != sizeof(reply))
+        return false;
+    if (stage != CONTROL_STAGE_SETUP)
+        return true;
+    return tud_control_xfer(rhport, request, reply, sizeof(reply));
+}
+
+// Do not claim unsupported interface requests without scheduling a response.
 static bool xinput_control_xfer_cb(uint8_t rhport,
                                    uint8_t stage,
                                    tusb_control_request_t const *request)
 {
 	(void) rhport;
-	(void) stage;
 	(void) request;
-	return true;
+	return stage != CONTROL_STAGE_SETUP;
 }
 
 static bool xinput_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
 {
 	(void) rhport;
-	(void) result;
 
 	if (ep_addr == xinput_ep_out) {
-		if (xferred_bytes > 0) {
+		if (result == XFER_RESULT_SUCCESS && xferred_bytes > 0) {
 			xinput_handle_out_packet(xinput_out_buf, (uint16_t) xferred_bytes);
 		}
 		// Re-arm the OUT endpoint so the next LED/rumble packet can arrive.
@@ -232,6 +248,11 @@ bool xinput_send_report(XInputReport const *report)
 	if (!tud_ready()) {
 		return false;
 	}
+	// open() runs before SET_CONFIGURATION has made tud_ready() true.
+	// Service OUT here too, so initial configuration, reset and resume can
+	// recover reception even when no previous OUT completion can re-arm it.
+	// Do this before checking IN busy: LED/rumble must drain independently.
+	xinput_arm_out();
 	if (xinput_ep_in == 0) {
 		return false; // not enumerated / interface not opened yet
 	}

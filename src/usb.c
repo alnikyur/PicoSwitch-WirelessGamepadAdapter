@@ -3,11 +3,10 @@
 #include <tusb.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include <pico/stdlib.h>
-#include <pico/cyw43_arch.h>
-#include <pico/multicore.h>
-#include <pico/async_context.h>
+#include "uni_log.h"
 
 #include "report.h"
 #include "xinput_device.h"
@@ -25,63 +24,60 @@
 
 // Report period. Matches bInterval = 4 ms in the IN endpoint descriptor.
 #define USB_REPORT_PERIOD_MS 4
+// USB stays attached across PC sleep and Bluetooth disconnects.
+// Only the host controls configuration/reset; no timed software re-enumeration.
+static bool usb_remote_wakeup_allowed;
 
-// ---------------------------------------------------------------------------
-// Attach / detach request shared between core1 (Bluepad32) and core0 (USB).
-// ---------------------------------------------------------------------------
-// Set from core1 when the PC turns off / goes to sleep, so the emulated Xbox
-// 360 controller actually disappears from the host. TinyUSB can only be driven
-// from core0, so core1 just posts a request here.
-static volatile bool usb_attach_requested = true;
-
-void usb_request_attach(bool attached)
-{
-	usb_attach_requested = attached;
+void tud_mount_cb(void) {
+	logi("USB: mounted\n");
+}
+void tud_umount_cb(void) {
+	usb_remote_wakeup_allowed = false;
+	logi("USB: unmounted\n");
+}
+void tud_suspend_cb(bool remote_wakeup_en) {
+	usb_remote_wakeup_allowed = remote_wakeup_en;
+	logi("USB: suspended, remote_wakeup=%d\n", remote_wakeup_en);
+}
+void tud_resume_cb(void) {
+	usb_remote_wakeup_allowed = false;
+	logi("USB: resumed\n");
 }
 
-bool usb_is_attach_requested(void)
+static bool usb_handle_suspend(bool input_changed, bool input_active)
 {
-	return usb_attach_requested;
+	if (!tud_suspended())
+		return false;
+	if (input_changed && input_active && usb_remote_wakeup_allowed)
+		tud_remote_wakeup();
+	return true;
 }
 
 void
 usb_core_task()
 {
 	tusb_init();
+	tud_connect();
 
 	XInputIdxReport r;
 	empty_xinput_report(&r);
+	XInputReport previous_report = r.report;
+	const XInputReport neutral_report = r.report;
 
 	const absolute_time_t boot = get_absolute_time();
 	absolute_time_t next_report = boot;
-	// Start from "not attached" and issue an explicit tud_connect() on the
-	// first iteration. This guarantees a known initial state on the bus
-	// regardless of what tusb_init() left configured.
-	bool usb_attached = false;
+	uint64_t next_health_log_us = time_us_64() + 60000000;
 
 	while (1) {
 		// IMPORTANT: tud_task() must run as often as possible, with no
 		// sleeps in this loop. All USB events are handled here.
 		tud_task();
 
-		// Apply a pending attach/detach request. This must run on this core
-		// because it touches the TinyUSB device stack directly.
-		bool want_attached = usb_attach_requested;
-		if (want_attached != usb_attached) {
-			if (want_attached) {
-				tud_connect();
-			} else {
-				tud_disconnect();
-			}
-			usb_attached = want_attached;
-		}
-
-		// While detached, do not send anything: the host must see the device
-		// as gone. tud_ready() would go false anyway, but skipping the report
-		// path entirely makes the intent explicit and avoids a race right
-		// after tud_disconnect().
-		if (!usb_attached) {
-			continue;
+		uint64_t now = time_us_64();
+		if (now >= next_health_log_us) {
+			next_health_log_us = now + 60000000;
+			logi("USB: alive mounted=%d suspended=%d\n",
+			     tud_mounted(), tud_suspended());
 		}
 
 		// Send reports on a fixed period, without blocking.
@@ -89,15 +85,6 @@ usb_core_task()
 			continue;
 		}
 		next_report = make_timeout_time_ms(USB_REPORT_PERIOD_MS);
-
-		if (!tud_ready()) {
-			continue;
-		}
-
-		if (tud_suspended()) {
-			tud_remote_wakeup();
-			continue;
-		}
 
 		int64_t elapsed_us = absolute_time_diff_us(boot, get_absolute_time());
 
@@ -117,6 +104,16 @@ usb_core_task()
 			r.report.header1 = XINPUT_REPORT_HEADER_1;
 		}
 #endif
+		bool changed = memcmp(&previous_report, &r.report, sizeof(r.report)) != 0;
+		previous_report = r.report;
+		// tud_ready() is false while suspended: handle wake before checking it.
+		// Only new input may request wake, and only when the host permitted it.
+		if (usb_handle_suspend(changed,
+		        memcmp(&r.report, &neutral_report, sizeof(r.report)) != 0)) {
+			continue;
+		}
+		if (!tud_ready())
+			continue;
 
 		// xinput_send_report() checks tud_ready() and endpoint busy
 		// state itself, so no extra guarding is needed here.

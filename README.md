@@ -15,8 +15,8 @@ This project is possible thanks to [Bluepad32](https://github.com/ricardoquesada
 - Bluetooth gamepad to Xbox 360 / XInput over USB.
 - Full button, D-pad, analog stick and analog trigger mapping.
 - On-board LED lights up while at least one gamepad is connected.
-- The gamepad can start or wake the PC, and the emulated controller disappears from the
-  host when the PC shuts down or goes to sleep.
+- The gamepad can start or wake the PC. The emulated USB controller stays attached
+  across sleep and Bluetooth disconnects, sending neutral reports when no pad is connected.
 - Manual force-power combo: `L1 + R1 + Home`.
 
 ## How it works
@@ -28,11 +28,11 @@ Both RP2040 cores have one job each:
 | core1 | `bluepad_core_task()` | cyw43/Bluetooth, Bluepad32 (`uni_*`) and the BTstack run loop. All gamepad callbacks and timers run here. |
 | core0 | `usb_core_task()` | TinyUSB device stack. Runs `tud_task()` and sends one XInput report every 4 ms. |
 
-Gamepad samples travel from core1 to core0 through `shared_report` in `src/report.c`: core1
-takes the cyw43 async context lock, copies the report and pushes the multicore FIFO; core0
-pops the FIFO and reads the report under the same lock. Attach/detach requests use a
-separate flag (`usb_request_attach()`), because TinyUSB may only be driven from the core
-that runs `tud_task()`.
+Gamepad samples travel from core1 to core0 through `shared_report` in `src/report.c`.
+A dedicated critical section protects only the short report copy; USB no longer waits
+for the cyw43 async context or uses the multicore FIFO for reports. The report lock
+is initialized before launching core1. Core0 is the only core that calls TinyUSB;
+USB attachment no longer depends on PC power state or Bluetooth connections.
 
 The Xbox 360 emulation is a custom TinyUSB class driver (`src/xinput_device.c`), not HID:
 VID/PID `0x045E:0x028E`, vendor interface `0xFF/0x5D/0x01`, interrupt IN `0x81` and OUT
@@ -71,13 +71,13 @@ LOW must persist for `PC_STATE_STABLE_MS` (100 ms). HIGH must persist for
 the greater of that interval and `PC_STATE_SLEEP_GUARD_MS` (3000 ms).
 While settling, no automatic button press is allowed.
 
-- **PC powered on** (`0 -> 1`): the emulated controller is re-attached to the USB bus, so
-  the host sees the gamepad again.
-- **PC shut down or went to sleep** (`1 -> 0`): the emulated controller is detached from
-  the host and every connected gamepad is disconnected.
+- **PC powered on**: input resumes on the existing USB controller; no software
+  disconnect/connect is requested.
+- **PC shut down or went to sleep** (`1 -> 0`): Bluetooth gamepads are disconnected.
+  Their reports are cleared to neutral; the USB controller remains attached.
 - **A gamepad becomes ready**: a pending request waits for a confirmed input state.
-  Stable LOW issues one 300 ms power-button press; stable HIGH cancels the request.
-  Disconnecting a gamepad cancels the pending request.
+  Stable LOW issues one 300 ms power-button press; stable HIGH skips the power button.
+  Neither case re-enumerates USB. Disconnecting a gamepad cancels the pending request.
 - **`L1 + R1 + Home`** forces a 300 ms press even when the firmware believes the PC is
   already on.
 
@@ -111,6 +111,48 @@ For normal operation, reconfigure with `-DPC_POWER_DRY_RUN=OFF` (and optionally
 `-DPC_STATE_DEBUG_UART=OFF`) and rebuild. CMake remembers these options; `make build`
 deletes the build directory and resets them to defaults.
 
+### Persistent USB across sleep and controller idle
+
+The firmware connects USB once at startup. It never disconnects/reconnects USB
+because of PC sleep, a Bluetooth connection, or an enumeration timeout. This avoids
+forcing Steam to rediscover a replacement input device after resume. Without a
+Bluetooth gamepad, the existing virtual controller produces neutral reports.
+The host can still reset/reconfigure its USB controller during S3 resume; firmware
+cannot prevent that or guarantee that Steam preserves its input handle.
+
+GP14 power detection and the GP15 wake pulse are unchanged. USB remote wake is
+handled before `tud_ready()`, only for changed, non-neutral input and when permitted
+by the host. Clearing a disconnected pad's buttons must not wake the sleeping PC.
+
+To diagnose Bazzite idle/sleep failures, enable `PC_STATE_DEBUG_UART=ON` with
+`PC_POWER_DRY_RUN=OFF`: actual PC wake remains enabled. UART logs include
+`USB: mounted`, `USB: unmounted`, `USB: suspended` and `USB: resumed`. Once per minute
+`USB: alive ...` and `power monitor alive ...` show whether both loops still run.
+
+After flashing, restart Steam once to establish a clean baseline. Test several
+sleep/wake cycles without restarting Steam, then let the Bluetooth gamepad switch
+itself off from inactivity and reconnect it. The virtual controller should remain
+available. If Steam loses it while evtest still receives buttons, capture Steam's
+`controller.txt` and host USB messages (`sudo journalctl -kf`). This mode is a test
+of the forced-re-enumeration hypothesis, not a confirmed fix for all Steam issues.
+
+The XInput driver services its OUT endpoint from the report loop as well as from
+completion callbacks: TinyUSB calls interface `open()` before `tud_ready()` becomes
+true, so relying on `open()` alone leaves host LED/rumble transfers pending forever.
+Polling also restores reception if an OUT completion occurred during suspend.
+The driver answers Linux xpad's `C1/01, wValue=0100, wIndex=0, length=20`
+initialization request with a neutral 20-byte report; unsupported requests stall
+instead of being silently accepted without a control response.
+
+Host regression tests (Python 3 and a C compiler; report test also uses pthreads):
+
+```bash
+python3 tests/test_pc_power.py
+python3 tests/test_usb_recovery.py
+python3 tests/test_report_handoff.py
+python3 tests/test_xinput_transport.py
+```
+
 ## Button mapping
 
 | Bluepad32 | XInput | Notes |
@@ -137,8 +179,8 @@ has no Xbox 360 equivalent and is ignored.
 | ---- | -------- |
 | `src/main.c` | Entry point: starts core1, then runs the USB task on core0. |
 | `src/pico_switch_platform.c` | Bluepad32 custom platform: device callbacks, Bluepad32 to XInput mapping, PC power control. |
-| `src/report.c` | Cross-core report hand-off (async context lock + multicore FIFO). |
-| `src/usb.c` | core0 report pump and thread-safe attach/detach requests. |
+| `src/report.c` | Cross-core report hand-off using a dedicated short critical section. |
+| `src/usb.c` | core0 report pump and persistent USB connection. |
 | `src/xinput_device.c` | Custom TinyUSB class driver for the Xbox 360 interface. |
 | `src/usb_descriptors.c` | USB device, configuration and string descriptors. |
 | `src/sdkconfig.h` | Bluepad32 configuration (4 devices max, custom platform, log level). |

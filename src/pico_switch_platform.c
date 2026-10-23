@@ -58,6 +58,7 @@ static bool pc_state_initialized = false; // false, пока не сделано
 static bool pc_candidate_on;
 static uint64_t pc_candidate_since_us;
 static bool power_request_pending;
+static uint64_t pc_last_health_log_us;
 
 // UNKNOWN means no stable decision yet; never treat it as OFF.
 typedef enum { PC_STATE_UNKNOWN, PC_STATE_OFF, PC_STATE_ON } pc_state_t;
@@ -141,9 +142,7 @@ static bool press_power_button_safe(bool force) {
 
 // Функция отключения всех подключенных геймпадов.
 //
-// Вызывается из btstack-таймера. Лок cyw43 async context — рекурсивный
-// (pico_cyw43_arch_none использует async_context_threadsafe_background),
-// поэтому повторный захват внутри set_global_gamepad_report() безопасен.
+// Вызывается из btstack-таймера; отчёты защищены отдельной короткой блокировкой.
 static void disconnect_all_controllers(void) {
     logi("my_platform: PC turned OFF/SLEEP! Disconnecting gamepad(s)...\n");
     for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
@@ -160,11 +159,11 @@ static void disconnect_all_controllers(void) {
 static void deferred_disconnect_timer_timeout(btstack_timer_source_t *timer) {
     (void)timer;
     deferred_disconnect_timer_active = false;
+    // A wake event can supersede a queued shutdown callback.
+    if (pc_state_initialized && last_pc_state)
+        return;
 
-    // Отсоединяем USB-устройство: так хост (Windows/Linux) реально видит,
-    // что геймпад исчез, а не продолжает получать репорты вечно.
-    usb_request_attach(false);
-
+    // Only disconnect Bluetooth; the neutral report keeps the USB pad present.
     disconnect_all_controllers();
 }
 
@@ -195,8 +194,9 @@ static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
         power_request_pending = false;
         if (state == PC_STATE_OFF)
             press_power_button_safe(false);
-        else
+        else {
             logi("my_platform: PC is ON, skipping automatic power press\n");
+        }
     }
 
     // Детектируем момент ВЫКЛЮЧЕНИЯ ПК (был 1, стал 0).
@@ -207,11 +207,10 @@ static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
         schedule_disconnect_all_controllers();
     }
 
-    // ПК снова включился: возвращаем USB-устройство на шину, чтобы хост
-    // снова увидел геймпад. Геймпады при этом переподключаются штатно.
-    if (pc_state_initialized && !last_pc_state && current_pc_state) {
-        logi("my_platform: Detected PC Power-ON event!\n");
-        usb_request_attach(true);
+    // Cancel stale Bluetooth shutdown work without touching USB enumeration.
+    if (current_pc_state) {
+        btstack_run_loop_remove_timer(&deferred_disconnect_timer);
+        deferred_disconnect_timer_active = false;
     }
 
     last_pc_state = current_pc_state;
@@ -221,6 +220,10 @@ static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
     // remove+add: таймер снимается process_timers() перед вызовом колбэка,
     // но remove() защищает от случайной повторной регистрации.
 rearm:
+    if (time_us_64() - pc_last_health_log_us >= 60000000) {
+        pc_last_health_log_us = time_us_64();
+        log_pc_state("power monitor alive");
+    }
     btstack_run_loop_remove_timer(timer);
     btstack_run_loop_set_timer(timer, PC_CHECK_INTERVAL_MS);
     btstack_run_loop_add_timer(timer);
@@ -427,7 +430,6 @@ static void pico_switch_platform_on_init_complete(void) {
     btstack_run_loop_add_timer(&pc_status_timer);
 
     logi("BLUEPAD: ready to fill reports\n");
-    multicore_fifo_push_blocking(0);
 }
 
 static void pico_switch_platform_on_device_connected(uni_hid_device_t* d) {
@@ -458,11 +460,6 @@ static void pico_switch_platform_on_device_disconnected(uni_hid_device_t* d) {
 
 static uni_error_t pico_switch_platform_on_device_ready(uni_hid_device_t* d) {
     logi("my_platform: device ready: %p\n", d);
-
-    // Геймпад готов: гарантированно возвращаем USB-устройство на шину.
-    // Если ПК был выключен и геймпадом его разбудили/включили, без этого
-    // хост не увидел бы контроллер после пробуждения.
-    usb_request_attach(true);
 
     // Безопасно включаем/разбуживаем ПК при готовности геймпада (false = не принудительно)
     log_pc_state("gamepad ready");

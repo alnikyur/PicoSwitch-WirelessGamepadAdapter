@@ -17,7 +17,7 @@ stubs = r'''
 #define logi(...) ((void)0)
 #define GPIO_OUT 1
 #define GPIO_IN 0
-#define CONFIG_BLUEPAD32_MAX_DEVICES 0
+#define CONFIG_BLUEPAD32_MAX_DEVICES 1
 typedef struct timer { bool active; unsigned ms; void (*handler)(struct timer*); } btstack_timer_source_t;
 typedef void uni_hid_device_t;
 static uint64_t now;
@@ -33,10 +33,11 @@ static void btstack_run_loop_set_timer_handler(btstack_timer_source_t *t, void (
 static void btstack_run_loop_set_timer(btstack_timer_source_t *t, unsigned ms) { t->ms = ms; }
 static void btstack_run_loop_add_timer(btstack_timer_source_t *t) { assert(!t->active); t->active = true; }
 static void btstack_run_loop_remove_timer(btstack_timer_source_t *t) { t->active = false; }
-static uni_hid_device_t* uni_hid_device_get_instance_for_idx(int i) { return 0; }
-static bool uni_hid_device_is_gamepad(uni_hid_device_t *d) { return false; }
-static void uni_hid_device_disconnect(uni_hid_device_t *d) {}
-static void usb_request_attach(bool attach) { if (attach) attaches++; else shutdowns++; }
+static uni_hid_device_t* uni_hid_device_get_instance_for_idx(int i) { static int pad; return &pad; }
+static bool uni_hid_device_is_gamepad(uni_hid_device_t *d) { return true; }
+static void uni_hid_device_disconnect(uni_hid_device_t *d) { shutdowns++; }
+static void usb_request_attach(bool attach) { assert(!"PC state must not change USB attachment"); }
+static void usb_request_reenumeration(void) { assert(!"PC state must not re-enumerate USB"); }
 '''
 cases = r'''
 static void tick(unsigned ms) {
@@ -68,8 +69,8 @@ int main(void) {
     // HIGH at boot, and reconnecting to an ON PC, must never auto-press.
     reset(1); power_request_pending = true;
     tick(100); tick(2999); assert(power_request_pending && assertions == 0);
-    tick(3000); assert(last_pc_state && !power_request_pending && assertions == 0);
-    power_request_pending = true; tick(3010); assert(assertions == 0);
+    tick(3000); assert(last_pc_state && !power_request_pending && assertions == 0 && attaches == 0);
+    power_request_pending = true; tick(3010); assert(assertions == 0 && attaches == 0);
     // A short LOW glitch is neither shutdown nor permission to press.
     input = 0; tick(3020); assert(!press_power_button_safe(false));
     input = 1; tick(3070); assert(last_pc_state && !deferred_disconnect_timer_active);
@@ -80,7 +81,10 @@ int main(void) {
     deferred_disconnect_timer.handler(&deferred_disconnect_timer);
     assert(shutdowns == 1);
     input = 1; tick(3200); tick(6200);
-    assert(last_pc_state && attaches == 1);
+    assert(last_pc_state && attaches == 0);
+    // A stale deferred shutdown must not detach USB after the wake transition.
+    deferred_disconnect_timer_timeout(&deferred_disconnect_timer);
+    assert(shutdowns == 1);
     // Sleep blinking: 1 s HIGH / 1 s LOW never qualifies as ON.
     reset(1); power_request_pending = true;
     for (unsigned ms = 0; ms <= 5000; ms += 10) {
