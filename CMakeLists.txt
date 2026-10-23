@@ -53,7 +53,15 @@ add_subdirectory(bluepad32/src/components/bluepad32 libbluepad32)
 # class driver in addition to our custom Xbox 360 driver, which is not part of
 # the Xbox 360 descriptors and would break the single-interface device.
 pico_enable_stdio_usb(PicoSwitchWGA 0)
-pico_enable_stdio_uart(PicoSwitchWGA 0)
+option(PC_STATE_DEBUG_UART "Log PC state via UART0 (GP0 TX, GP1 RX)" OFF)
+option(PC_POWER_DRY_RUN "Log power presses without asserting GPIO15" OFF)
+pico_enable_stdio_uart(PicoSwitchWGA ${PC_STATE_DEBUG_UART})
+if(PC_STATE_DEBUG_UART)
+    target_compile_definitions(PicoSwitchWGA PRIVATE PC_STATE_DEBUG_UART=1)
+endif()
+if(PC_POWER_DRY_RUN)
+    target_compile_definitions(PicoSwitchWGA PRIVATE PC_POWER_DRY_RUN=1)
+endif()
 
 # create map/bin/hex/uf2 file in addition to ELF.
 pico_add_extra_outputs(PicoSwitchWGA)

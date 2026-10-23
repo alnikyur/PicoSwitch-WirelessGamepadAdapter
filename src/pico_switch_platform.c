@@ -25,10 +25,28 @@
 // Конфигурация пинов управления ПК
 // --------------------------------------------------------------------------
 #define POWER_BTN_GPIO 15   // База транзистора C1815 (Active-HIGH, 1 = нажато)
-#define PC_SENSE_GPIO  14   // Пин отслеживания PLED+ с колодки JFP1 (1 = ПК включен)
+#define PC_STATE_PIN 14     // Collector of the external PLED-sense NPN transistor
+#define PC_STATE_ACTIVE_LEVEL 1
+#define PC_STATE_STABLE_MS 100
+// Must exceed the longest HIGH phase of the motherboard's sleep LED.
+#define PC_STATE_SLEEP_GUARD_MS 3000
+#ifndef PC_POWER_DRY_RUN
+#define PC_POWER_DRY_RUN 0  // 1: log decisions, never assert the power-button GPIO
+#endif
+
+#if PC_STATE_PIN < 0 || PC_STATE_PIN > 28 || PC_STATE_PIN == 23 || \
+    PC_STATE_PIN == 24 || PC_STATE_PIN == 25 || PC_STATE_PIN == POWER_BTN_GPIO
+#error "PC_STATE_PIN must be an available Pico W GPIO, distinct from POWER_BTN_GPIO"
+#endif
+#if defined(PC_STATE_DEBUG_UART) && (PC_STATE_PIN == 0 || PC_STATE_PIN == 1)
+#error "PC_STATE_PIN conflicts with diagnostic UART0"
+#endif
+#if PC_STATE_ACTIVE_LEVEL != 0 && PC_STATE_ACTIVE_LEVEL != 1
+#error "PC_STATE_ACTIVE_LEVEL must be 0 or 1"
+#endif
 
 #define POWER_PRESS_MS 300
-#define PC_CHECK_INTERVAL_MS 1000 // Проверка статуса ПК каждую секунду
+#define PC_CHECK_INTERVAL_MS 10
 
 static btstack_timer_source_t btn_off_timer;
 static btstack_timer_source_t pc_status_timer;
@@ -37,11 +55,35 @@ static bool deferred_disconnect_timer_active = false;
 static bool btn_timer_active = false;
 static bool last_pc_state = false; // Храним последнее известное состояние ПК
 static bool pc_state_initialized = false; // false, пока не сделано первое измерение
+static bool pc_candidate_on;
+static uint64_t pc_candidate_since_us;
+static bool power_request_pending;
 
-// true, когда ПК выключен/спит и геймпады отключены.
-// Пока этот флаг установлен, USB-устройство отсоединено от хоста,
-// поэтому ПК реально «теряет» геймпад, а не продолжает слать репорты.
-static bool pc_off = false;
+// UNKNOWN means no stable decision yet; never treat it as OFF.
+typedef enum { PC_STATE_UNKNOWN, PC_STATE_OFF, PC_STATE_ON } pc_state_t;
+
+static pc_state_t read_pc_state(void) {
+    bool on = gpio_get(PC_STATE_PIN) == PC_STATE_ACTIVE_LEVEL;
+    uint64_t now = time_us_64();
+    if (on != pc_candidate_on) {
+        pc_candidate_on = on;
+        pc_candidate_since_us = now;
+    }
+    uint32_t required_ms = PC_STATE_STABLE_MS;
+    if (on && required_ms < PC_STATE_SLEEP_GUARD_MS)
+        required_ms = PC_STATE_SLEEP_GUARD_MS;
+    if (now - pc_candidate_since_us < (uint64_t)required_ms * 1000)
+        return PC_STATE_UNKNOWN;
+    return on ? PC_STATE_ON : PC_STATE_OFF;
+}
+
+static void log_pc_state(const char* event) {
+    pc_state_t state = read_pc_state();
+    logi("my_platform: %s PC_STATE_PIN=GP%d raw=%d state=%s dry_run=%d\n",
+         event, PC_STATE_PIN, gpio_get(PC_STATE_PIN),
+         state == PC_STATE_ON ? "ON" : state == PC_STATE_OFF ? "OFF" : "SETTLING",
+         PC_POWER_DRY_RUN);
+}
 
 // Инициализация пинов для управления ПК
 static void pc_power_control_init(void) {
@@ -50,13 +92,14 @@ static void pc_power_control_init(void) {
     gpio_pull_down(POWER_BTN_GPIO);
     gpio_put(POWER_BTN_GPIO, 0);
 
-    gpio_init(PC_SENSE_GPIO);
-    gpio_set_dir(PC_SENSE_GPIO, GPIO_IN);
-    gpio_pull_down(PC_SENSE_GPIO);
-
-    // Начальное считывание состояния ПК
-    last_pc_state = (gpio_get(PC_SENSE_GPIO) == 1);
-    pc_state_initialized = true;
+    gpio_init(PC_STATE_PIN);
+    gpio_set_dir(PC_STATE_PIN, GPIO_IN);
+    gpio_pull_up(PC_STATE_PIN);
+    pc_candidate_on = gpio_get(PC_STATE_PIN) == PC_STATE_ACTIVE_LEVEL;
+    pc_candidate_since_us = time_us_64();
+    pc_state_initialized = false;
+    power_request_pending = false;
+    log_pc_state("startup");
 }
 
 // Колбэк таймера: отжимаем кнопку питания через 300 мс
@@ -67,45 +110,25 @@ static void btn_off_timer_timeout(btstack_timer_source_t *timer) {
     logi("my_platform: Power button RELEASED\n");
 }
 
-// Неблокирующая проверка «ПК действительно включён».
-//
-// Раньше здесь было 10 замеров с sleep_ms(50) прямо на потоке run loop
-// (500 мс). Это блокировало обработку BTstack/cyw43, из-за чего отложенный
-// таймер отключения успевал зарегистрироваться повторно (btstack_assert),
-// и прошивка переставала реагировать на выключение ПК.
-//
-// Теперь мы просто снимаем несколько быстрых отсчётов подряд (микросекунды),
-// а длинное усреднение делает периодический таймер pc_status_timer.
-static bool is_pc_fully_on(void) {
-    // 8 быстрых отсчётов подряд: у включённого ПК PLED горит непрерывно,
-    // у спящего — мигает, поэтому любой ноль означает «не включён».
-    for (int i = 0; i < 8; i++) {
-        if (gpio_get(PC_SENSE_GPIO) != 1) {
-            return false;
-        }
-        sleep_us(50);
-    }
-    return true;
-}
-
-// Функция безопасного импульса нажатия кнопки
+// Automatic presses require a freshly confirmed OFF input.
 static bool press_power_button_safe(bool force) {
-    if (btn_timer_active && !force) {
+    if (btn_timer_active) {
         logi("my_platform: Button press already in progress...\n");
         return false;
     }
 
-    // Если не просили принудительно — проверяем, не включен ли ПК.
-    // Если ПК уже помечен как выключенный (pc_off), не трогаем кнопку:
-    // включение выполняется только по явному событию готовности геймпада.
     if (!force) {
-        if (!pc_off && is_pc_fully_on()) {
-            logi("my_platform: PC is FULLY ON (solid PLED), skipping press\n");
+        if (read_pc_state() != PC_STATE_OFF) {
+            logi("my_platform: PC is ON or SETTLING, skipping press\n");
             return false;
         }
     }
 
-    logi("my_platform: PC is OFF or SLEEPING -> PRESSING power button!\n");
+    if (PC_POWER_DRY_RUN) {
+        logi("my_platform: DRY RUN: would press power button (force=%d)\n", force);
+        return true;
+    }
+    logi("my_platform: PRESSING power button (force=%d)\n", force);
     gpio_put(POWER_BTN_GPIO, 1);
 
     btstack_run_loop_set_timer_handler(&btn_off_timer, btn_off_timer_timeout);
@@ -161,18 +184,26 @@ static void schedule_disconnect_all_controllers(void) {
 
 // Периодический мониторинг состояния ПК
 static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
-    int sense_1 = gpio_get(PC_SENSE_GPIO);
-    sleep_us(100);
-    int sense_2 = gpio_get(PC_SENSE_GPIO);
+    pc_state_t state = read_pc_state();
+    if (state == PC_STATE_UNKNOWN)
+        goto rearm;
+    bool current_pc_state = state == PC_STATE_ON;
+    if (!pc_state_initialized || current_pc_state != last_pc_state)
+        log_pc_state("confirmed");
 
-    bool current_pc_state = (sense_1 == 1 && sense_2 == 1);
+    if (power_request_pending) {
+        power_request_pending = false;
+        if (state == PC_STATE_OFF)
+            press_power_button_safe(false);
+        else
+            logi("my_platform: PC is ON, skipping automatic power press\n");
+    }
 
     // Детектируем момент ВЫКЛЮЧЕНИЯ ПК (был 1, стал 0).
     // Только при первом измерении НЕ сравниваем: иначе выключенный на момент
     // старта ПК сразу даст ложное событие.
     if (pc_state_initialized && last_pc_state && !current_pc_state) {
         logi("my_platform: Detected PC Shutdown/Sleep event!\n");
-        pc_off = true;
         schedule_disconnect_all_controllers();
     }
 
@@ -180,7 +211,6 @@ static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
     // снова увидел геймпад. Геймпады при этом переподключаются штатно.
     if (pc_state_initialized && !last_pc_state && current_pc_state) {
         logi("my_platform: Detected PC Power-ON event!\n");
-        pc_off = false;
         usb_request_attach(true);
     }
 
@@ -190,6 +220,7 @@ static void pc_status_timer_timeout(btstack_timer_source_t *timer) {
     // Перезапускаем таймер проверки.
     // remove+add: таймер снимается process_timers() перед вызовом колбэка,
     // но remove() защищает от случайной повторной регистрации.
+rearm:
     btstack_run_loop_remove_timer(timer);
     btstack_run_loop_set_timer(timer, PC_CHECK_INTERVAL_MS);
     btstack_run_loop_add_timer(timer);
@@ -359,7 +390,6 @@ static void pico_switch_platform_init(int argc, const char** argv) {
     connected_controllers = 0;
     pc_state_initialized = false;
     deferred_disconnect_timer_active = false;
-    pc_off = false;
 
     uni_gamepad_mappings_t mappings = GAMEPAD_DEFAULT_MAPPINGS;
 
@@ -391,7 +421,7 @@ static void pico_switch_platform_on_init_complete(void) {
 
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
 
-    // Запускаем фоновый мониторинг состояния ПК (каждую секунду)
+    // Неблокирующий опрос состояния ПК каждые PC_CHECK_INTERVAL_MS.
     btstack_run_loop_set_timer_handler(&pc_status_timer, pc_status_timer_timeout);
     btstack_run_loop_set_timer(&pc_status_timer, PC_CHECK_INTERVAL_MS);
     btstack_run_loop_add_timer(&pc_status_timer);
@@ -402,11 +432,14 @@ static void pico_switch_platform_on_init_complete(void) {
 
 static void pico_switch_platform_on_device_connected(uni_hid_device_t* d) {
     logi("my_platform: device connected: %p\n", d);
+    log_pc_state("gamepad connected");
 }
 
 static void pico_switch_platform_on_device_disconnected(uni_hid_device_t* d) {
     logi("my_platform: device disconnected: %p\n", d);
     
+    power_request_pending = false;
+    btstack_run_loop_remove_timer(&btn_off_timer);
     btn_timer_active = false;
     gpio_put(POWER_BTN_GPIO, 0); // Безопасное отключение транзистора
 
@@ -432,23 +465,9 @@ static uni_error_t pico_switch_platform_on_device_ready(uni_hid_device_t* d) {
     usb_request_attach(true);
 
     // Безопасно включаем/разбуживаем ПК при готовности геймпада (false = не принудительно)
-    press_power_button_safe(false);
-
-    // НЕ перезаписываем last_pc_state здесь безусловно.
-    // Если записать состояние, пока ПК ещё грузится (PLED = 0), мы потеряем
-    // фронт 1->0 при последующем выключении и геймпад не отключится.
-    // Состоянием управляет только pc_status_timer_timeout().
-    // Единственное, что делаем: если состояние ещё ни разу не измерялось —
-    // фиксируем текущее как начальное.
-    if (!pc_state_initialized) {
-        last_pc_state = (gpio_get(PC_SENSE_GPIO) == 1);
-        pc_state_initialized = true;
-    }
-
-    // Если ПК включён — снимаем флаг «выключен».
-    if (last_pc_state) {
-        pc_off = false;
-    }
+    log_pc_state("gamepad ready");
+    // Wait for stable LOW or HIGH in the polling timer without blocking BTstack.
+    power_request_pending = true;
 
     connected_controllers++;
     set_led_status();

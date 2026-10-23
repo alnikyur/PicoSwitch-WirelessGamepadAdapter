@@ -54,24 +54,62 @@ Only two GPIOs are used beyond the USB connection:
 | Pico W pin | Direction | Purpose |
 | ---------- | --------- | ------- |
 | `GPIO 15` | Output | Drives the base of an NPN transistor (C1815) wired across the PC's power-button pins. HIGH = button pressed. |
-| `GPIO 14` | Input (pull-down) | Reads the PC power LED (`PLED+` from the front-panel header). `1` = PC on. |
+| `GPIO 14` | Input (pull-up) | Reads the collector of the external PLED-sense NPN transistor. HIGH = PC on, LOW = PC off. Never connect PLED+ directly. |
 
 `GPIO 15` is driven LOW and has a pull-down at boot, so the transistor stays off while the
 Pico resets.
 
 ## Power control
 
-The firmware polls the power-sense pin once per second:
+The sense circuit uses a separate 2SC1815Y: R1 (10 kohm) between PLED+ and
+PLED-, R2 (10 kohm) from PLED- to the base, emitter to common PC/Pico GND,
+collector to GP14. The internal pull-up supplies the GPIO's HIGH level.
+
+The firmware polls the power-sense pin every 10 ms without blocking Bluetooth.
+`PC_STATE_PIN` (14) and `PC_STATE_ACTIVE_LEVEL` (1) configure the input.
+LOW must persist for `PC_STATE_STABLE_MS` (100 ms). HIGH must persist for
+the greater of that interval and `PC_STATE_SLEEP_GUARD_MS` (3000 ms).
+While settling, no automatic button press is allowed.
 
 - **PC powered on** (`0 -> 1`): the emulated controller is re-attached to the USB bus, so
   the host sees the gamepad again.
 - **PC shut down or went to sleep** (`1 -> 0`): the emulated controller is detached from
   the host and every connected gamepad is disconnected.
-- **A gamepad becomes ready** and the PC is not fully on: a 300 ms power-button press is
-  issued to start or wake the PC. `is_pc_fully_on()` takes eight samples 50 us apart, so
-  the blinking power LED of a sleeping PC is not mistaken for "on".
+- **A gamepad becomes ready**: a pending request waits for a confirmed input state.
+  Stable LOW issues one 300 ms power-button press; stable HIGH cancels the request.
+  Disconnecting a gamepad cancels the pending request.
 - **`L1 + R1 + Home`** forces a 300 ms press even when the firmware believes the PC is
   already on.
+
+Sleep detection requires the guard interval to exceed the longest HIGH phase of
+the sleep LED, and LOW phases long enough to be sampled and debounced. Adjust it
+for your motherboard. A digital input cannot distinguish a steady dim LED from
+an on LED if both produce the same logic level; pulses shorter than the polling
+interval can also be missed. This is not universal sleep-state detection.
+
+### Power-state diagnostics
+
+Both diagnostic options default to OFF. To log decisions without pressing the
+power button (including the manual combo), build with:
+
+```bash
+cmake -S . -B build -DPICO_BOARD=pico_w -DPC_STATE_DEBUG_UART=ON -DPC_POWER_DRY_RUN=ON
+cmake --build build -j
+```
+
+Use a **3.3 V TTL** USB-UART adapter: Pico GP0 (TX) to adapter RX and common GND,
+115200 baud, 8N1. GP1 is reserved for UART RX in this build. USB CDC remains
+disabled to preserve the controller USB descriptors. Capture UART before reset.
+
+Expect `startup ... raw=0/1 state=SETTLING dry_run=1`, followed by
+`confirmed ... state=OFF` (LOW) or `state=ON` (HIGH). Each gamepad connection
+logs `gamepad connected` and `gamepad ready` with the raw and filtered input.
+For OFF, expect `DRY RUN: would press power button (force=0)`; for ON, expect
+`PC is ON, skipping automatic power press`. GPIO15 stays LOW in dry-run mode.
+
+For normal operation, reconfigure with `-DPC_POWER_DRY_RUN=OFF` (and optionally
+`-DPC_STATE_DEBUG_UART=OFF`) and rebuild. CMake remembers these options; `make build`
+deletes the build directory and resets them to defaults.
 
 ## Button mapping
 
@@ -172,7 +210,8 @@ cmake --build build -j
 ### Notes
 
 - USB stdio must stay disabled. Enabling it would pull in a CDC class driver next to the
-  Xbox 360 driver and break the single-interface device. UART stdio is disabled as well.
+  Xbox 360 driver and break the single-interface device. UART stdio is disabled by default;
+  enable `PC_STATE_DEBUG_UART` for power-state diagnostics.
 - For the first 5 seconds after boot, neutral reports are sent, so the host always sees a
   live device even before a gamepad connects.
 - Reports are sent every 4 ms, matching `bInterval` in the IN endpoint descriptor.
